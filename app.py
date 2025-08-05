@@ -1,72 +1,65 @@
 from flask import Flask, request, jsonify
 from pybit.unified_trading import HTTP
+import time
 
 app = Flask(__name__)
 
-# Your TradingView passphrase
 WEBHOOK_PASSPHRASE = "abc123"
 
-# Mainnet API keys
 API_KEY = "P95IalDQwSpUFZvUTQ51US1ovWfSRhAuYVTg"
 API_SECRET = "red36cu3AaIIxEDXUO"
 
-# Connect to Bybit Mainnet
 session = HTTP(
-    testnet=False,
+    testnet=False,  # MAINNET
     api_key=API_KEY,
     api_secret=API_SECRET
 )
 
-# Trade parameters
 SYMBOL = "SOLUSDT"
 LEVERAGE = 60
-MARGIN = 3  # 3 USDT
-TP_USD = 2  # Take profit: $2
-SL_USD = 1  # Stop loss: $1
+MARGIN = 3
+ENTRY_PRICE = None
 
-@app.route("/", methods=["GET"])
+
+def position_is_open():
+    try:
+        response = session.get_positions(category="linear", symbol=SYMBOL)
+        pos = response["result"]["list"][0]
+        return float(pos["size"]) > 0
+    except Exception as e:
+        print("Position check failed:", e)
+        return False
+
+
+@app.route("/")
 def home():
-    return "Bybit Mainnet Bot is Running"
+    return "✅ Bybit Bot is Running on Railway"
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
-    print("Incoming Webhook:", data)
+    print("Webhook Data:", data)
 
-    # Check passphrase
     if data.get("passphrase") != WEBHOOK_PASSPHRASE:
-        return jsonify({"error": "Wrong passphrase"}), 403
+        return jsonify({"error": "Invalid passphrase"}), 403
 
-    side = data.get("side")
-    if side != "sell":
-        return jsonify({"error": "Only short (sell) positions are allowed"}), 400
+    if data.get("side").lower() != "sell":
+        return jsonify({"error": "Only short trades allowed"}), 400
 
-    # Check if already in position
-    try:
-        pos = session.get_positions(category="linear", symbol=SYMBOL)
-        size = float(pos['result']['list'][0]['size'])
-        if size > 0:
-            return jsonify({"message": "Position already open. Waiting for it to close."}), 200
-    except Exception as e:
-        return jsonify({"error": f"Position check failed: {str(e)}"}), 500
-
-    # Get market price to calculate quantity
-    try:
-        price_data = session.get_tickers(category="linear", symbol=SYMBOL)
-        last_price = float(price_data['result']['list'][0]['lastPrice'])
-    except Exception as e:
-        return jsonify({"error": f"Price fetch error: {str(e)}"}), 500
-
-    # Calculate quantity based on margin and leverage
-    trade_value = MARGIN * LEVERAGE
-    qty = round(trade_value / last_price, 3)
-
-    # Calculate SL and TP price
-    sl_price = round(last_price + (SL_USD / qty), 2)
-    tp_price = round(last_price - (TP_USD / qty), 2)
+    if position_is_open():
+        return jsonify({"message": "Position already open. Waiting for TP or SL."}), 200
 
     try:
-        # Place short order
+        # Assume SOLUSDT is ~$20
+        entry_price = session.get_ticker(category="linear", symbol=SYMBOL)["result"]["list"][0]["lastPrice"]
+        entry_price = float(entry_price)
+
+        qty = round((MARGIN * LEVERAGE) / entry_price, 3)
+        tp_price = round(entry_price * 0.967, 3)  # ~2 USDT gain
+        sl_price = round(entry_price * 1.0167, 3)  # ~1 USDT loss
+
+        # Open short position
         order = session.place_order(
             category="linear",
             symbol=SYMBOL,
@@ -74,20 +67,29 @@ def webhook():
             order_type="Market",
             qty=qty,
             time_in_force="GoodTillCancel",
-            reduce_only=False,
+            reduce_only=False
+        )
+
+        time.sleep(1)  # Delay to ensure position opens
+
+        # Set TP/SL
+        session.set_trading_stop(
+            category="linear",
+            symbol=SYMBOL,
             take_profit=tp_price,
             stop_loss=sl_price
         )
+
         return jsonify({
-            "message": "Short position opened",
-            "entry_price": last_price,
-            "tp_price": tp_price,
-            "sl_price": sl_price,
-            "qty": qty,
-            "order": order
+            "message": "✅ Short position placed",
+            "entry_price": entry_price,
+            "tp": tp_price,
+            "sl": sl_price
         }), 200
+
     except Exception as e:
-        return jsonify({"error": f"Order placement failed: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run()
