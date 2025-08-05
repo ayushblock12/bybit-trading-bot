@@ -1,3 +1,2 @@
-Flask
-pybit==5.8.0
-gunicorn
+flask
+pybit
