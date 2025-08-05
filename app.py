@@ -1,102 +1,92 @@
 from flask import Flask, request
-import bybit
+from pybit.unified_trading import HTTP
 import threading
 
 app = Flask(__name__)
 
-# ⛔ YOUR BYBIT TESTNET API KEYS (already provided)
-API_KEY = 'P95IalDQwSpUFZvUTQ51US1ovWfSRhAuYVTg'
-API_SECRET = 'red36cu3AaIIxEDXUO'
+# Bybit testnet credentials
+api_key = "P95IalDQwSpUFZvUTQ51US1ovWfSRhAuYVTg"
+api_secret = "red36cu3AaIIxEDXUO"
 
-# ✅ Use Bybit testnet
-client = bybit.bybit(test=True, api_key=API_KEY, api_secret=API_SECRET)
+session = HTTP(
+    testnet=True,
+    api_key=api_key,
+    api_secret=api_secret
+)
 
-# 🧠 Trading settings
-SYMBOL = "SOLUSDT"
-LEVERAGE = 60
-MARGIN = 3  # USDT
-TP_USDT = 2
-SL_USDT = 1
+# Config
+symbol = "SOLUSDT"
+leverage = 60
+margin = 3
+in_position = False
 
-position_open = False
+@app.route("/", methods=["GET"])
+def index():
+    return "Bybit bot is running."
 
-@app.route('/webhook', methods=['POST'])
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    global position_open
-    data = request.json
+    global in_position
 
-    if position_open:
-        return "Position already open", 200
+    data = request.get_json()
 
-    if data.get("action") == "short":
-        threading.Thread(target=place_short_trade).start()
-        return "Short signal received", 200
+    if data is None or "passphrase" not in data or data["passphrase"] != "your_secret_pass":
+        return {"error": "Invalid passphrase"}, 401
 
-    return "Invalid signal", 400
+    if in_position:
+        return {"status": "Already in a trade"}
 
-def place_short_trade():
-    global position_open
+    threading.Thread(target=open_trade).start()
+    return {"status": "Short trade signal received"}
+
+def open_trade():
+    global in_position
+
     try:
-        # Cancel all open orders before starting
-        client.LinearOrder.LinearOrder_cancelAll(symbol=SYMBOL).result()
+        in_position = True
 
-        # Set leverage
-        client.LinearPositions.LinearPositions_saveLeverage(
-            symbol=SYMBOL, buy_leverage=LEVERAGE, sell_leverage=LEVERAGE).result()
+        # Get current price
+        price = float(session.get_orderbook(symbol=symbol)["result"]["b"][0][0])
 
-        # Get current market price
-        ticker = client.Market.Market_symbolInfo(symbol=SYMBOL).result()
-        mark_price = float(ticker[0]['result'][0]['last_price'])
+        # Calculate quantity
+        qty = round((margin * leverage) / price, 2)
 
-        # Calculate quantity to short
-        qty = round((MARGIN * LEVERAGE) / mark_price, 3)
-
-        # Open short position
-        client.LinearOrder.LinearOrder_new(
-            symbol=SYMBOL,
+        # Place market short order
+        session.place_order(
+            category="linear",
+            symbol=symbol,
             side="Sell",
             order_type="Market",
             qty=qty,
             time_in_force="GoodTillCancel",
             reduce_only=False
-        ).result()
+        )
 
-        position_open = True
+        entry_price = price
+        sl_price = round(entry_price + (1 / qty), 3)
+        tp_price = round(entry_price - (2 / qty), 3)
 
-        # Calculate TP and SL prices
-        tp_price = round(mark_price - (TP_USDT / qty), 3)
-        sl_price = round(mark_price + (SL_USDT / qty), 3)
+        # Set stop loss & take profit
+        session.set_trading_stop(
+            category="linear",
+            symbol=symbol,
+            stop_loss=str(sl_price),
+            take_profit=str(tp_price)
+        )
 
-        # Set Take Profit order
-        client.LinearOrder.LinearOrder_new(
-            symbol=SYMBOL,
-            side="Buy",
-            order_type="Limit",
-            qty=qty,
-            price=tp_price,
-            time_in_force="GoodTillCancel",
-            reduce_only=True
-        ).result()
-
-        # Set Stop Loss
-        client.LinearOrder.LinearOrder_new_stop(
-            symbol=SYMBOL,
-            side="Buy",
-            order_type="Market",
-            qty=qty,
-            stop_loss=sl_price,
-            base_price=mark_price,
-            time_in_force="GoodTillCancel",
-            reduce_only=True
-        ).result()
+        print("Short position opened")
 
     except Exception as e:
-        print("❌ Error placing trade:", str(e))
-        position_open = False
+        print("Error placing order:", e)
 
-@app.route('/')
-def home():
-    return "✅ Bybit bot is running 24/7"
+    finally:
+        # Monitor the position and wait for TP/SL
+        while True:
+            pos = session.get_positions(category="linear", symbol=symbol)["result"]["list"][0]
+            if float(pos["size"]) == 0:
+                in_position = False
+                print("Position closed.")
+                break
 
-if __name__ == '__main__':
-    app.run()
+if __name__ == "__main__":
+    app.run(debug=True)
